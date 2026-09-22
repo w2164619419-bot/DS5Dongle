@@ -61,7 +61,11 @@ jobs:
           git log -1 --oneline
 
       - name: Copy WoL module files into source tree
-        if: matrix.variant == 'wol'
+        # ★ lwip-only 也必须拷 lwipopts.h ★
+        # 因为 lwIP 的 lwip/opt.h 一定会 #include "lwipopts.h"，
+        # 而它又 include 了 wol_config.h。漏拷就会
+        # fatal error: lwipopts.h: No such file or directory。
+        if: matrix.variant != 'none'
         run: |
           cp fork/src/wol_config.h "$DS5_DIR/src/"
           cp fork/src/lwipopts.h   "$DS5_DIR/src/"
