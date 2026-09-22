@@ -1,25 +1,22 @@
 # 在 GitHub Actions 上构建「DS5Dongle + WoL」固件
 #
-# 为什么用云端构建：本机 xpack 工具链产出的固件在真机上 USB 枚举失败
-# （同一份"完全原版源码"用官方工具链编就正常），差异只在工具链。
+# ★ 一次 Run 会产出 3 个变体固件，用来二分定位问题 ★
+#   none      —— 完全原版源码，只用云端工具链（验证环境）
+#   lwip-only —— 只删掉 CYW43_LWIP=0（让 lwIP 链进来），不含 wol_net 代码
+#   wol       —— 完整版（lwIP + wol_net 模块 + main.cpp 三行调用）
 #
-# 重要：这个 workflow **自己 clone 上游仓库的指定 ref**（默认 v0.7.2-hotfix），
-# 不使用你 fork 里的分支内容 —— 因为 fork 默认停在 master，而 master 与你手上
-# 能用的固件不是同一个版本（功能更多、RAM 更高）。你的 fork 只用来放：
-#   - src/wol_config.h / lwipopts.h / wol_net.h / wol_net.cpp
-#   - 这个 workflow 文件本身
+# 为什么要这三个：云端已用「与官方 release 相同的工具链」编出完整的 wol 版，
+# 结果仍然"无法识别的 USB 设备"，所以差异只剩我加的两块改动（CYW43_LWIP=1 与
+# wol_net）。这三个变体可以把它们分开。
+#
+# 重要：workflow **自己 clone 上游指定 ref**（默认 v0.7.2-hotfix），
+# 不使用你 fork 的分支内容 —— fork 只当"放文件的地方"。
 #
 # 复刻官方 CI（.github/workflows/build-firmware.yml）的关键点：
 #   - Pico SDK 2.2.0
 #   - TinyUSB 必须切到 0.20.0（不切会导致 TUD_AUDIO_EP_SIZE 宏签名不匹配）
 #   - ARM 官方 GNU Toolchain 14.2.rel1
 #   - Release 构建
-#
-# Wi-Fi 凭据有两种给法（二选一）：
-#   A) 直接填进 src/wol_config.h 一起提交 —— 此时务必把仓库设为 Private！
-#   B) 用仓库 Secrets（推荐，本 workflow 已支持）：
-#        WOL_WIFI_SSID / WOL_WIFI_PASSWORD / WOL_KEY / WOL_WIFI_ENABLE
-#      编译前自动注入，日志里把值打成 "***"
 
 name: Build DS5 Bridge + WoL
 
@@ -27,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       ds5_ref:
-        description: 'DS5Dongle git ref (tag/branch/sha) —— 要与你想刷的固件同源'
+        description: 'DS5Dongle git ref (tag/branch/sha)'
         required: false
         default: 'v0.7.2-hotfix'
       version:
@@ -38,13 +35,18 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [none, lwip-only, wol]
     env:
       PICO_SDK_REF: '2.2.0'
       TINYUSB_REF: '0.20.0'
       DS5_REPO: 'https://github.com/awalol/DS5Dongle.git'
       DS5_DIR: ${{ github.workspace }}/ds5
+      VARIANT: ${{ matrix.variant }}
     steps:
-      - name: Checkout my fork (只为了拿 4 个 WoL 模块文件)
+      - name: Checkout my fork (只为了拿 WoL 模块文件)
         uses: actions/checkout@v4
         with:
           path: fork
@@ -57,16 +59,14 @@ jobs:
           git submodule update --init --recursive
           echo "--- 源码版本 ---"
           git log -1 --oneline
-          echo "--- add_executable 段（供排查）---"
-          grep -n -A14 'add_executable(ds5-bridge' CMakeLists.txt || true
 
       - name: Copy WoL module files into source tree
+        if: matrix.variant == 'wol'
         run: |
           cp fork/src/wol_config.h "$DS5_DIR/src/"
           cp fork/src/lwipopts.h   "$DS5_DIR/src/"
           cp fork/src/wol_net.h    "$DS5_DIR/src/"
           cp fork/src/wol_net.cpp  "$DS5_DIR/src/"
-          echo "--- 已放入的模块文件 ---"
           ls -l "$DS5_DIR/src/" | grep -i wol
 
       - name: Install build tools
@@ -95,13 +95,18 @@ jobs:
           git checkout --detach "${TINYUSB_REF}"
           echo "TinyUSB now at: $(git describe --tags --always)"
 
-      - name: Patch CMakeLists.txt and src/main.cpp
+      - name: Patch source (variant aware)
         working-directory: ${{ env.DS5_DIR }}
         run: |
+          echo "======= VARIANT = $VARIANT ======="
           python3 <<'PATCHEOF'
           import io
+          import os
           import re
           import sys
+
+          variant = os.environ.get('VARIANT', 'wol')
+          print('variant = %s' % variant)
 
 
           def read(p):
@@ -117,71 +122,81 @@ jobs:
           s = read(p)
           nl = '\r\n' if '\r\n' in s[:4000] else '\n'
 
-          # 1) 去掉 CYW43_LWIP=0（整行）
-          s2 = re.sub(r'^[ \t]*CYW43_LWIP=0[ \t]*' + re.escape(nl), '', s, flags=re.M)
-          if s2 == s:
-              print('FAIL: CYW43_LWIP=0 那一行没找到')
-              sys.exit(1)
-          s = s2
-          print('ok: 删掉 CYW43_LWIP=0')
-
-          # 2) 在 add_executable(ds5-bridge ... ) 源文件列表末尾插入 src/wol_net.cpp
-          anchor = 'add_executable(ds5-bridge'
-          i = s.find(anchor)
-          if i < 0:
-              print('FAIL: 找不到 add_executable(ds5-bridge')
-              sys.exit(1)
-          j = s.find(nl + ')', i)
-          if j < 0:
-              print('FAIL: 找不到 add_executable 列表的结束括号')
-              sys.exit(1)
-          if 'wol_net.cpp' in s[i:j]:
-              print('ok: src/wol_net.cpp 已在列表里')
+          if variant == 'none':
+              print('none: 源码保持原样，不打任何补丁')
           else:
-              s = s[:j] + nl + '        src/wol_net.cpp' + s[j:]
-              print('ok: 插入 src/wol_net.cpp')
-
-          # 3) 链接库换成 lwip 版
-          s2, n = re.subn(r'^([ \t]*)pico_cyw43_arch_poll[ \t]*$',
-                          r'\1pico_cyw43_arch_lwip_poll', s, flags=re.M)
-          if n != 1:
-              print('FAIL: pico_cyw43_arch_poll 匹配 %d 次（应为 1）' % n)
-              sys.exit(1)
-          s = s2
-          print('ok: pico_cyw43_arch_poll -> pico_cyw43_arch_lwip_poll')
-          write(p, s)
-
-          # ---------------- src/main.cpp ----------------
-          p = 'src/main.cpp'
-          s = read(p)
-          nl = '\r\n' if '\r\n' in s[:4000] else '\n'
-
-
-          def insert_after(text, anchor_text, addition, label):
-              if addition.strip() in text:
-                  print('ok: %s（已存在）' % label)
-                  return text
-              k = text.find(anchor_text)
-              if k < 0:
-                  print('FAIL: %s —— 锚点没找到: %r' % (label, anchor_text))
+              # 1) 删掉 CYW43_LWIP=0
+              s2 = re.sub(r'^[ \t]*CYW43_LWIP=0[ \t]*' + re.escape(nl), '', s, flags=re.M)
+              if s2 == s:
+                  print('FAIL: CYW43_LWIP=0 那一行没找到')
                   sys.exit(1)
-              k += len(anchor_text)
-              print('ok: %s' % label)
-              return text[:k] + addition + text[k:]
+              s = s2
+              print('ok: 删掉 CYW43_LWIP=0')
 
+              # 2) 链接库换成 lwip 版
+              s2, n = re.subn(r'^([ \t]*)pico_cyw43_arch_poll[ \t]*$',
+                              r'\1pico_cyw43_arch_lwip_poll', s, flags=re.M)
+              if n != 1:
+                  print('FAIL: pico_cyw43_arch_poll 匹配 %d 次（应为 1）' % n)
+                  sys.exit(1)
+              s = s2
+              print('ok: pico_cyw43_arch_poll -> pico_cyw43_arch_lwip_poll')
 
-          s = insert_after(s, nl + '#include "wake.h"' + nl,
-                           '#include "wol_net.h"' + nl, '加 #include "wol_net.h"')
-          s = insert_after(s, nl + '    wake_init();' + nl,
-                           '    wol_net_init();' + nl, '加 wol_net_init();')
-          s = insert_after(s, nl + '        cyw43_arch_poll();' + nl,
-                           '        wol_net_poll();' + nl, '加 wol_net_poll();')
+              # 3) 只有 wol 变体才把 wol_net.cpp 加进可执行目标
+              if variant == 'wol':
+                  i = s.find('add_executable(ds5-bridge')
+                  if i < 0:
+                      print('FAIL: 找不到 add_executable(ds5-bridge')
+                      sys.exit(1)
+                  j = s.find(nl + ')', i)
+                  if j < 0:
+                      print('FAIL: 找不到 add_executable 列表的结束括号')
+                      sys.exit(1)
+                  if 'wol_net.cpp' in s[i:j]:
+                      print('ok: src/wol_net.cpp 已在列表里')
+                  else:
+                      s = s[:j] + nl + '        src/wol_net.cpp' + s[j:]
+                      print('ok: 插入 src/wol_net.cpp')
+              else:
+                  print('lwip-only: 不加 wol_net.cpp')
+
           write(p, s)
 
-          print('==== 所有补丁已应用 ====')
+          # ---------------- src/main.cpp（只有 wol 变体改）----------------
+          if variant == 'wol':
+              p = 'src/main.cpp'
+              s = read(p)
+              nl = '\r\n' if '\r\n' in s[:4000] else '\n'
+
+
+              def insert_after(text, anchor_text, addition, label):
+                  if addition.strip() in text:
+                      print('ok: %s（已存在）' % label)
+                      return text
+                  k = text.find(anchor_text)
+                  if k < 0:
+                      print('FAIL: %s —— 锚点没找到: %r' % (label, anchor_text))
+                      sys.exit(1)
+                  k += len(anchor_text)
+                  print('ok: %s' % label)
+                  return text[:k] + addition + text[k:]
+
+
+              s = insert_after(s, nl + '#include "wake.h"' + nl,
+                               '#include "wol_net.h"' + nl, '加 #include "wol_net.h"')
+              s = insert_after(s, nl + '    wake_init();' + nl,
+                               '    wol_net_init();' + nl, '加 wol_net_init();')
+              s = insert_after(s, nl + '        cyw43_arch_poll();' + nl,
+                               '        wol_net_poll();' + nl, '加 wol_net_poll();')
+              write(p, s)
+          else:
+              print('%s: 不改 src/main.cpp' % variant)
+
+          print('==== 补丁完成（variant=%s）====' % variant)
           PATCHEOF
 
-      - name: Inject Wi-Fi credentials from repository secrets (optional)
+      - name: Inject Wi-Fi credentials from repository secrets (wol variant only)
+        if: matrix.variant == 'wol'
         working-directory: ${{ env.DS5_DIR }}
         env:
           WIFI_SSID: ${{ secrets.WOL_WIFI_SSID }}
@@ -223,8 +238,19 @@ jobs:
           io.open(p, 'w', encoding='utf-8', newline='').write(s)
           print('secret injection done')
           PY
-          echo "--- 注入后的相关行（值已打码）---"
-          grep -n 'WOL_WIFI_SSID\|WOL_WIFI_PASSWORD\|WOL_KEY\|WOL_WIFI_ENABLE' src/wol_config.h | sed 's/"[^"]*"/"***"/'
+          grep -n 'WOL_WIFI_SSID\|WOL_WIFI_PASSWORD\|WOL_KEY\|WOL_WIFI_ENABLE' src/wol_config.h | sed 's/"[^"]*"/"***"/' || true
+
+      - name: Verify patch result
+        working-directory: ${{ env.DS5_DIR }}
+        run: |
+          echo "=== CYW43_LWIP 相关 ==="
+          grep -n 'CYW43_LWIP' CMakeLists.txt || echo "  (CMakeLists 里已无 CYW43_LWIP，即默认为 1)"
+          echo "=== cyw43_arch 链接库 ==="
+          grep -n 'pico_cyw43_arch' CMakeLists.txt || true
+          echo "=== wol_net 是否在源码列表 ==="
+          grep -n 'wol_net' CMakeLists.txt || echo "  (未包含 wol_net)"
+          echo "=== main.cpp 里的 wol_net 调用 ==="
+          grep -n 'wol_net' src/main.cpp || echo "  (无)"
 
       - name: Configure
         working-directory: ${{ env.DS5_DIR }}
@@ -233,7 +259,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DPICO_SDK_PATH="$HOME/pico-sdk" \
             -DPICO_TOOLCHAIN_PATH="$HOME/arm-toolchain" \
-            -DVERSION="${{ inputs.version }}"
+            -DVERSION="${{ inputs.version }}-${{ matrix.variant }}"
 
       - name: Build
         working-directory: ${{ env.DS5_DIR }}
@@ -248,7 +274,7 @@ jobs:
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: ds5-bridge-wol-firmware
+          name: firmware-${{ matrix.variant }}
           path: |
             ${{ env.DS5_DIR }}/build/ds5-bridge.uf2
             ${{ env.DS5_DIR }}/build/ds5-bridge.elf
