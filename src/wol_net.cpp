@@ -173,6 +173,31 @@ static void wifi_enter_backoff(void) {
 }
 
 static void wifi_begin_connect(void) {
+    // ★ 关键：必须先启用 STA 模式，否则永远拿不到 IP ★
+    //
+    // cyw43_arch_enable_sta_mode() -> cyw43_wifi_set_up(&cyw43_state, STA, true, ...)
+    //   -> cyw43_ctrl.c:566-569  if ((itf_state & (1<<STA)) == 0)
+    //                              cyw43_cb_tcpip_init(self, itf);
+    //   -> cyw43_lwip.c:194-227   netif_add() + netif_set_default() + netif_set_up()
+    //                              + dhcp_set_struct() + dhcp_start()
+    //
+    // 也就是说 netif 的挂载和 DHCP 的启动**都是这一步顺带完成的**，SDK 不需要
+    // 用户自己调 netif_add（我原来以为要自己加，是查错了目录：netif_add 不在
+    // pico-sdk/src 里，而在 pico-sdk/lib/cyw43-driver/src/cyw43_lwip.c）。
+    //
+    // 而 cyw43_arch_wifi_connect_async() 只是转手调用 cyw43_wifi_join()，
+    // **完全不会**启用 STA 模式。所以漏掉这一句的后果是：无线可能确实连上了，
+    // 但 lwIP 里根本没有 cyw43 的 netif，DHCP 不跑，IP 永远是 0.0.0.0，
+    // HTTP 服务也就永远没人能访问到。
+    //
+    // 只做一次；重复调用虽然基本幂等，但没必要。
+    static bool sta_mode_done = false;
+    if (!sta_mode_done) {
+        cyw43_arch_enable_sta_mode();
+        sta_mode_done = true;
+        WOL_LOG("WiFi: STA mode enabled (netif + DHCP 已就绪)\n");
+    }
+
     WOL_LOG("WiFi connecting... (%s)\n", WOL_WIFI_SSID);
 
     // 非阻塞：立刻返回，连接过程由 cyw43_arch_poll() 在后台推进
