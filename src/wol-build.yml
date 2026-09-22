@@ -1,0 +1,185 @@
+# 在 GitHub Actions 上构建「DS5Dongle + WoL」固件
+#
+# 为什么用云端构建：本机 xpack 工具链产出的固件在真机上 USB 枚举失败
+# （连"完全原版源码"都失败），而官方 CI 的固件正常 —— 差异只在工具链。
+# 这个 workflow 复刻了仓库自带 CI（.github/workflows/build-firmware.yml）的关键点：
+#   - Pico SDK 2.2.0
+#   - TinyUSB 必须切到 0.20.0（不切会导致 TUD_AUDIO_EP_SIZE 宏签名不匹配）
+#   - ARM 官方 GNU Toolchain 14.2.rel1
+#   - Release 构建
+#
+# Wi-Fi 凭据有两种给法（二选一）：
+#   A) 直接把 SSID/密码填进 src/wol_config.h 一起提交
+#      —— 此时务必把仓库设为 Private，否则密码会公开在 GitHub 上！
+#   B) 不填文件，改用仓库 Secrets（推荐）：
+#      Settings → Secrets and variables → Actions → New repository secret
+#         WOL_WIFI_SSID      你的 2.4G Wi-Fi 名
+#         WOL_WIFI_PASSWORD  密码
+#         WOL_KEY            唤醒口令
+#         WOL_WIFI_ENABLE    1（开了才会真的连 Wi-Fi）
+#      本 workflow 会在编译前自动把它们注入 wol_config.h（日志里会打码）。
+#
+# 用法：
+#   1. Fork awalol/DS5Dongle 到自己的账号
+#   2. 把 4 个模块文件上传到 fork 的 src/ 目录
+#   3. 把这个文件上传到 fork 的 .github/workflows/ 目录
+#   4. Actions → Build DS5 Bridge + WoL → Run workflow
+#   5. 等 5~10 分钟，下载 artifact 里的 ds5-bridge.uf2，拖进 Pico 磁盘
+
+name: Build DS5 Bridge + WoL
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Firmware version string'
+        required: false
+        default: 'v0.7.2-wol'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      PICO_SDK_REF: '2.2.0'
+      TINYUSB_REF: '0.20.0'
+    steps:
+      - name: Checkout (with lib/WDL and lib/opus submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build gcc g++ python3 xz-utils
+
+      - name: Download ARM GNU Toolchain 14.2.rel1
+        run: |
+          mkdir -p "$HOME/arm-toolchain"
+          curl -fsSL "https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-x86_64-arm-none-eabi.tar.xz" \
+            | tar -xJ -C "$HOME/arm-toolchain" --strip-components=1
+          "$HOME/arm-toolchain/bin/arm-none-eabi-gcc" --version | head -1
+
+      - name: Clone Pico SDK with submodules
+        run: |
+          git clone --depth 1 --branch "${PICO_SDK_REF}" https://github.com/raspberrypi/pico-sdk.git "$HOME/pico-sdk"
+          git -C "$HOME/pico-sdk" submodule update --init --recursive
+
+      - name: Switch TinyUSB to configured tag
+        run: |
+          cd "$HOME/pico-sdk/lib/tinyusb"
+          if ! git rev-parse -q --verify "refs/tags/${TINYUSB_REF}" >/dev/null; then
+            git fetch --depth 1 origin "refs/tags/${TINYUSB_REF}:refs/tags/${TINYUSB_REF}"
+          fi
+          git checkout --detach "${TINYUSB_REF}"
+          echo "TinyUSB now at: $(git describe --tags --always)"
+
+      - name: Patch CMakeLists.txt and src/main.cpp
+        run: |
+          python3 <<'PATCHEOF'
+          import io
+          import sys
+
+
+          def patch(path, edits):
+              s = io.open(path, encoding='utf-8', newline='').read()
+              nl = '\r\n' if '\r\n' in s[:4000] else '\n'
+              for label, old, new in edits:
+                  o = old.replace('\n', nl)
+                  n = new.replace('\n', nl)
+                  cnt = s.count(o)
+                  if cnt != 1:
+                      print('FAIL: %s (expected 1 occurrence, got %d)' % (label, cnt))
+                      sys.exit(1)
+                  s = s.replace(o, n)
+                  print('ok: %s' % label)
+              io.open(path, 'w', encoding='utf-8', newline='').write(s)
+
+
+          patch('CMakeLists.txt', [
+              ('remove CYW43_LWIP=0', '        CYW43_LWIP=0\n', ''),
+              ('add src/wol_net.cpp', '        src/ram_mem.c\n)',
+               '        src/ram_mem.c\n        src/wol_net.cpp\n)'),
+              ('use lwip poll arch', '        pico_cyw43_arch_poll\n',
+               '        pico_cyw43_arch_lwip_poll\n'),
+          ])
+
+          patch('src/main.cpp', [
+              ('include wol_net.h', '#include "wake.h"\n',
+               '#include "wake.h"\n#include "wol_net.h"\n'),
+              ('call wol_net_init()', '    wake_init();\n',
+               '    wake_init();\n    wol_net_init();\n'),
+              ('call wol_net_poll()', '        cyw43_arch_poll();\n',
+               '        cyw43_arch_poll();\n        wol_net_poll();\n'),
+          ])
+          print('all patches applied')
+          PATCHEOF
+
+      - name: Inject Wi-Fi credentials from repository secrets (optional)
+        env:
+          WIFI_SSID: ${{ secrets.WOL_WIFI_SSID }}
+          WIFI_PASSWORD: ${{ secrets.WOL_WIFI_PASSWORD }}
+          WOL_KEY: ${{ secrets.WOL_KEY }}
+          WIFI_ENABLE: ${{ secrets.WOL_WIFI_ENABLE }}
+        run: |
+          if [ -z "$WIFI_SSID" ] && [ -z "$WOL_KEY" ] && [ -z "$WIFI_ENABLE" ]; then
+            echo "没有配置 Secrets —— 直接使用仓库里的 src/wol_config.h"
+            exit 0
+          fi
+          python3 <<'PY'
+          import io
+          import os
+          import re
+
+          p = 'src/wol_config.h'
+          s = io.open(p, encoding='utf-8', newline='').read()
+
+
+          def repl(name, value):
+              global s
+              if not value:
+                  return
+              pat = re.compile(r'^(#define\s+' + name + r'\s+)".*?"', re.M)
+              s, n = pat.subn(lambda m: m.group(1) + '"' + value + '"', s)
+              print('  %s: %d replacement(s)' % (name, n))
+
+
+          repl('WOL_WIFI_SSID', os.environ.get('WIFI_SSID', ''))
+          repl('WOL_WIFI_PASSWORD', os.environ.get('WIFI_PASSWORD', ''))
+          repl('WOL_KEY', os.environ.get('WOL_KEY', ''))
+
+          en = os.environ.get('WIFI_ENABLE', '').strip()
+          if en in ('0', '1'):
+              s = re.sub(r'^(#define\s+WOL_WIFI_ENABLE\s+)\d+', r'\g<1>' + en, s, flags=re.M)
+              print('  WOL_WIFI_ENABLE -> ' + en)
+
+          io.open(p, 'w', encoding='utf-8', newline='').write(s)
+          print('secret injection done')
+          PY
+          echo "--- 注入后的相关行（值已打码）---"
+          grep -n 'WOL_WIFI_SSID\|WOL_WIFI_PASSWORD\|WOL_KEY\|WOL_WIFI_ENABLE' src/wol_config.h | sed 's/"[^"]*"/"***"/'
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPICO_SDK_PATH="$HOME/pico-sdk" \
+            -DPICO_TOOLCHAIN_PATH="$HOME/arm-toolchain" \
+            -DVERSION="${{ inputs.version }}"
+
+      - name: Build
+        run: cmake --build build --target ds5-bridge -j "$(nproc)"
+
+      - name: Show firmware size
+        run: |
+          "$HOME/arm-toolchain/bin/arm-none-eabi-size" build/ds5-bridge.elf
+          ls -l build/ds5-bridge.uf2
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: ds5-bridge-wol-firmware
+          path: |
+            build/ds5-bridge.uf2
+            build/ds5-bridge.elf
+          if-no-files-found: error
